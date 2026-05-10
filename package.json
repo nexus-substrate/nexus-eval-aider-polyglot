@@ -1,12 +1,12 @@
 {
-  "name": "nexus-eval-BENCHMARK",
-  "version": "0.0.1",
-  "description": "TEMPLATE — Replace with: '<benchmark-name> evaluation harness for nexus-agents'",
+  "name": "nexus-eval-aider-polyglot",
+  "version": "0.1.0",
+  "description": "Aider polyglot evaluation harness for nexus-agents — multi-language code-edit benchmark across 6 languages (Python, JavaScript, TypeScript, Go, Rust, C++)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "nexus-eval-BENCHMARK": "dist/cli.js"
+    "nexus-eval-aider-polyglot": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
@@ -20,7 +20,11 @@
     "nexus-agents",
     "nexus-agents-eval",
     "benchmark",
-    "evaluation"
+    "evaluation",
+    "aider",
+    "aider-polyglot",
+    "polyglot",
+    "code-edit"
   ],
   "author": "",
   "license": "MIT",
