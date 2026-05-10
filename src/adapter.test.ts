@@ -1,31 +1,171 @@
 /**
- * Smoke tests for the template adapter. These prove the scaffold works
- * out of the box — your benchmark-specific tests should go alongside
- * your replaced implementations.
+ * Smoke tests for AiderPolyglotAdapter.
+ *
+ * Mocks IModelAdapter so tests don't make real model calls. Asserts the
+ * BenchmarkAdapter contract end-to-end against the bundled fixture.
  */
-import { describe, it, expect } from 'vitest';
-import { runBenchmark } from 'nexus-agents';
-import { TemplateBenchmarkAdapter } from './adapter.js';
+import { describe, it, expect, vi } from 'vitest';
+import { ok, runBenchmark, type IModelAdapter } from 'nexus-agents';
+import { AiderPolyglotAdapter } from './adapter.js';
+import { extractEditedFiles } from './runner/file-extractor.js';
+import { composeUserPrompt, getSystemPrompt } from './runner/prompt-template.js';
+import type { AiderInstance } from './types.js';
 
-describe('TemplateBenchmarkAdapter', () => {
-  it('runs end-to-end with default stub logic', async () => {
-    const adapter = new TemplateBenchmarkAdapter();
-    const summary = await runBenchmark(adapter, {});
-    expect(summary.name).toBe('template-bench');
-    expect(summary.total).toBeGreaterThan(0);
-    expect(summary.passRate).toBeGreaterThanOrEqual(0);
-    expect(summary.passRate).toBeLessThanOrEqual(1);
+const fixtureInstance: AiderInstance = {
+  instanceId: 'python/return-ok',
+  language: 'python',
+  problemStatement: 'Make solve("foo") return "ok".',
+  editableFiles: {
+    'solve.py': 'def solve(x):\n    return ""\n',
+  },
+};
+
+function makeMockModelAdapter(response: string): IModelAdapter {
+  const completion = vi.fn(() => Promise.resolve(ok({ content: response })));
+  return {
+    providerId: 'mock',
+    modelId: 'mock-aider-model',
+    capabilities: [],
+    complete: completion as never,
+    stream: (() => (async function* () {})()) as never,
+    countTokens: () => Promise.resolve(0),
+    validateConfig: () => ({ ok: true as const, value: undefined }),
+  };
+}
+
+describe('AiderPolyglotAdapter', () => {
+  it('parses fenced path-tagged blocks into edited files', async () => {
+    const response = '```python path=solve.py\ndef solve(x):\n    return "ok" if x else ""\n```';
+    const adapter = new AiderPolyglotAdapter(makeMockModelAdapter(response));
+    const prediction = await adapter.runInstance(fixtureInstance, {} as never);
+    expect(prediction.editedFiles['solve.py']).toContain('return "ok" if x else ""');
   });
 
-  it('carries variant onto the summary', async () => {
-    const adapter = new TemplateBenchmarkAdapter({ variant: 'mini' });
-    const summary = await runBenchmark(adapter, {});
-    expect(summary.variant).toBe('mini');
+  it('drops hallucinated paths the instance did not declare editable', async () => {
+    const response =
+      '```python path=solve.py\ndef solve(x):\n    return "ok"\n```\n```python path=hallucinated.py\nprint("nope")\n```';
+    const adapter = new AiderPolyglotAdapter(makeMockModelAdapter(response));
+    const prediction = await adapter.runInstance(fixtureInstance, {} as never);
+    expect(Object.keys(prediction.editedFiles)).toEqual(['solve.py']);
   });
 
-  it('honors limit option', async () => {
-    const adapter = new TemplateBenchmarkAdapter();
-    const summary = await runBenchmark(adapter, {}, { limit: 1 });
-    expect(summary.total).toBe(1);
+  it('records empty-edit responses without throwing', async () => {
+    const adapter = new AiderPolyglotAdapter(makeMockModelAdapter('I cannot solve this.'));
+    const prediction = await adapter.runInstance(fixtureInstance, {} as never);
+    expect(Object.keys(prediction.editedFiles)).toHaveLength(0);
+    const verdict = await adapter.evaluate(fixtureInstance, prediction);
+    expect(verdict.editsProduced).toBe(false);
+    expect(adapter.isPass(verdict)).toBe(false);
+  });
+
+  it('isPass true when edits non-empty', async () => {
+    const response = '```python path=solve.py\ndef solve(x):\n    return "ok"\n```';
+    const adapter = new AiderPolyglotAdapter(makeMockModelAdapter(response));
+    const prediction = await adapter.runInstance(fixtureInstance, {} as never);
+    const verdict = await adapter.evaluate(fixtureInstance, prediction);
+    expect(adapter.isPass(verdict)).toBe(true);
+    expect(verdict.editedFileCount).toBe(1);
+  });
+
+  it('end-to-end against bundled fixture (6 languages)', async () => {
+    // Mock returns a non-empty edit for whatever path the instance asked
+    // about. We use a generic response that matches the fixture's known
+    // single-file shape per language.
+    const response = '```text path={{path}}\nedited\n```';
+    const completion = vi.fn((req: { messages: { content: string }[] }) => {
+      // Find the editable path from the user prompt + substitute.
+      const userText = req.messages[req.messages.length - 1]?.content ?? '';
+      const pathMatch = /--- ([^\s]+) ---/.exec(userText);
+      const path = pathMatch?.[1] ?? 'solve.py';
+      const filled = response.replace('{{path}}', path);
+      return Promise.resolve(ok({ content: filled }));
+    });
+    const adapter = new AiderPolyglotAdapter(
+      {
+        providerId: 'mock',
+        modelId: 'mock',
+        capabilities: [],
+        complete: completion as never,
+        stream: (() => (async function* () {})()) as never,
+        countTokens: () => Promise.resolve(0),
+        validateConfig: () => ({ ok: true as const, value: undefined }),
+      },
+      { source: 'fixture' }
+    );
+    const summary = await runBenchmark(adapter, {});
+    expect(summary.name).toBe('aider-polyglot');
+    expect(summary.total).toBe(6);
+    expect(summary.passed).toBe(6);
+  });
+
+  it('language filter narrows the fixture set', async () => {
+    const adapter = new AiderPolyglotAdapter(makeMockModelAdapter(''), {
+      source: 'fixture',
+      languages: ['rust', 'go'],
+    });
+    const instances = await adapter.loadInstances({});
+    expect(instances).toHaveLength(2);
+    expect(instances.every((i) => i.language === 'rust' || i.language === 'go')).toBe(true);
+  });
+
+  it('summarize byLanguage breakdown drops zero-instance entries', () => {
+    const adapter = new AiderPolyglotAdapter(makeMockModelAdapter(''));
+    const verdicts = [
+      { instanceId: 'a', language: 'python' as const, editsProduced: true, editedFileCount: 1 },
+      { instanceId: 'b', language: 'go' as const, editsProduced: false, editedFileCount: 0, error: 'empty' },
+    ];
+    const summary = adapter.summarize(verdicts, 200);
+    const meta = summary.metadata as {
+      byLanguage: Record<string, { total: number; passed: number; passRate: number }>;
+    };
+    expect(meta.byLanguage['python']).toEqual({ total: 1, passed: 1, passRate: 1 });
+    expect(meta.byLanguage['go']).toEqual({ total: 1, passed: 0, passRate: 0 });
+    // Languages with 0 instances should not appear in the breakdown.
+    expect(meta.byLanguage['rust']).toBeUndefined();
+  });
+});
+
+describe('extractEditedFiles', () => {
+  it('parses one fenced block per file', () => {
+    const response = '```py path=a.py\nA\n```\n```py path=b.py\nB\n```';
+    const out = extractEditedFiles(response);
+    expect(out['a.py']).toBe('A');
+    expect(out['b.py']).toBe('B');
+  });
+
+  it('returns empty object for no-edits responses', () => {
+    expect(extractEditedFiles('I cannot solve this.')).toEqual({});
+  });
+
+  it('handles multi-line file content', () => {
+    const response = '```py path=solve.py\ndef solve(x):\n    return "ok"\n```';
+    expect(extractEditedFiles(response)['solve.py']).toBe('def solve(x):\n    return "ok"');
+  });
+});
+
+describe('prompt template', () => {
+  it('system prompt names the fenced path= format', () => {
+    expect(getSystemPrompt()).toContain('path=');
+    expect(getSystemPrompt()).toContain('fenced');
+  });
+
+  it('user prompt includes problem + each editable file', () => {
+    const prompt = composeUserPrompt({
+      ...fixtureInstance,
+      editableFiles: { 'a.py': 'AAA', 'b.py': 'BBB' },
+    });
+    expect(prompt).toContain('a.py');
+    expect(prompt).toContain('AAA');
+    expect(prompt).toContain('b.py');
+    expect(prompt).toContain('BBB');
+  });
+
+  it('includes context files separately when present', () => {
+    const prompt = composeUserPrompt({
+      ...fixtureInstance,
+      contextFiles: { 'helpers.py': 'HELP' },
+    });
+    expect(prompt).toContain('Read-only context');
+    expect(prompt).toContain('HELP');
   });
 });
