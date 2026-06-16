@@ -46,5 +46,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nexus-substrate/nexus-eval-aider-polyglot.git"
+  },
+  "overrides": {
+    "qs": ">=6.15.2"
   }
 }
