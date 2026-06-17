@@ -18,6 +18,24 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { loadFromGithub } from './github-loader.js';
 
+/**
+ * Exact-hostname match for routing mocked fetch calls.
+ *
+ * Substring checks like `u.includes('api.github.com')` match spoofed hosts
+ * (`api.github.com.evil.com`, `api.github.com@evil.com`, `evilapi.github.com`),
+ * which is the `js/incomplete-url-substring-sanitization` pattern. We parse
+ * the URL and compare the hostname exactly (allowing only true subdomains).
+ */
+function hostMatches(url: string, host: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return hostname === host || hostname.endsWith('.' + host);
+}
+
 interface TreeEntry {
   path: string;
   type: 'blob' | 'tree';
@@ -131,7 +149,7 @@ describe('loadFromGithub', () => {
   it('caches the per-language index — second call does not refetch', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request) => {
       const u = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
-      if (u.includes('api.github.com')) {
+      if (hostMatches(u, 'api.github.com')) {
         return makeTreeResponse([
           {
             path: 'benchmark/exercises/python/exercises/x/instructions.md',
@@ -165,7 +183,7 @@ describe('loadFromGithub', () => {
     process.env['GITHUB_TOKEN'] = 'sekret';
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const u = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
-      if (u.includes('api.github.com')) {
+      if (hostMatches(u, 'api.github.com')) {
         const headers = init?.headers as Record<string, string> | undefined;
         expect(headers?.['authorization']).toBe('Bearer sekret');
         return makeTreeResponse([]);
@@ -305,5 +323,20 @@ describe('loadFromGithub', () => {
     }>;
     expect(cached).toHaveLength(1);
     expect(cached[0]?.instanceId).toBe('go/sum');
+  });
+});
+
+describe('hostMatches (exact-hostname routing)', () => {
+  it('accepts the exact host and true subdomains', () => {
+    expect(hostMatches('https://api.github.com/repos/x', 'api.github.com')).toBe(true);
+    expect(hostMatches('https://raw.githubusercontent.com/x', 'githubusercontent.com')).toBe(true);
+  });
+
+  it('rejects spoofed hosts that a substring check would accept', () => {
+    expect(hostMatches('https://api.github.com.evil.com/x', 'api.github.com')).toBe(false);
+    expect(hostMatches('https://evilapi.github.com/x', 'api.github.com')).toBe(false);
+    // userinfo `@` trick: real host is evil.com.
+    expect(hostMatches('https://api.github.com@evil.com/x', 'api.github.com')).toBe(false);
+    expect(hostMatches('not a url at all', 'api.github.com')).toBe(false);
   });
 });
